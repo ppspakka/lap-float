@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>Lap Float</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --muted: #8e8e93;
+    --card: #1c1c1e;
+    --green: #30d158;
+    --orange: #ff9f0a;
+    --red: #ff453a;
+    --blue: #0a84ff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    max-width: 480px; margin: 0 auto;
+  }
+  h1 { font-size: 17px; font-weight: 600; text-align: center; margin: 4px 0 12px; color: var(--muted); }
+  #preview {
+    display: block; width: 100%; max-width: 320px; aspect-ratio: 1; margin: 0 auto 16px;
+    border-radius: 20px; background: #000;
+  }
+  .row { display: flex; gap: 12px; margin-bottom: 12px; }
+  button {
+    flex: 1; font: inherit; font-size: 17px; font-weight: 600; padding: 16px 0;
+    border: 0; border-radius: 14px; color: var(--fg); background: var(--card);
+  }
+  button:active { opacity: .6; }
+  #startBtn { background: var(--green); color: #000; }
+  #startBtn.running { background: var(--red); color: #fff; }
+  #floatBtn { background: var(--blue); }
+  button:disabled { opacity: .35; }
+  .hint { font-size: 13px; color: var(--muted); line-height: 1.45; margin: 4px 0 16px; }
+  .hint b { color: var(--fg); }
+  #laps { list-style: none; padding: 0; margin: 0 0 16px; font-variant-numeric: tabular-nums; }
+  #laps li {
+    display: flex; justify-content: space-between; padding: 10px 4px;
+    border-bottom: 1px solid #2c2c2e; font-size: 16px;
+  }
+  #laps li span:first-child { color: var(--muted); }
+  details { background: var(--card); border-radius: 12px; padding: 10px 12px; }
+  summary { font-size: 14px; color: var(--muted); }
+  #log { font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; margin: 8px 0 0; max-height: 240px; overflow: auto; }
+  /* The PiP source video must be in the DOM and "visible" to Safari, but we don't need to see it. */
+  #pipVideo { position: fixed; width: 2px; height: 2px; bottom: 0; right: 0; opacity: 0.01; pointer-events: none; }
+</style>
+</head>
+<body>
+  <h1>Lap Float · test build</h1>
+
+  <canvas id="preview" width="400" height="400"></canvas>
+
+  <div class="row">
+    <button id="startBtn">Start</button>
+    <button id="lapBtn" disabled>Lap</button>
+  </div>
+  <div class="row">
+    <button id="resetBtn">Reset</button>
+    <button id="floatBtn">Float ⧉</button>
+  </div>
+
+  <p class="hint">
+    Tap <b>Float</b>, then swipe home. In the floating window, tap once to show controls,
+    then tap <b>⏸</b> to start a <b>new lap</b>. Lap time turns
+    <span style="color:var(--orange)">orange at 1:00</span> and
+    <span style="color:var(--red)">red at 2:00</span>.
+  </p>
+
+  <ul id="laps"></ul>
+
+  <details>
+    <summary>Debug log (send me this if something breaks)</summary>
+    <div id="log"></div>
+  </details>
+
+  <video id="pipVideo" muted playsinline autoplay></video>
+
+<script>
+(() => {
+  const SIZE = 400;
+  const canvas = document.getElementById('preview');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('pipVideo');
+  const startBtn = document.getElementById('startBtn');
+  const lapBtn = document.getElementById('lapBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const floatBtn = document.getElementById('floatBtn');
+  const lapsEl = document.getElementById('laps');
+  const logEl = document.getElementById('log');
+
+  // ---- Debug log ----
+  const t0 = performance.now();
+  function log(msg) {
+    const s = ((performance.now() - t0) / 1000).toFixed(1).padStart(6);
+    logEl.textContent = `${s}s  ${msg}\n` + logEl.textContent;
+  }
+  log(`UA: ${navigator.userAgent}`);
+  log(`pictureInPictureEnabled=${!!document.pictureInPictureEnabled}, ` +
+      `webkitSupportsPresentationMode=${typeof video.webkitSupportsPresentationMode === 'function'}, ` +
+      `captureStream=${typeof canvas.captureStream === 'function'}`);
+
+  // ---- Stopwatch state (timestamp-based, so it stays correct even if JS was frozen) ----
+  let running = false;
+  let startAt = 0;      // Date.now() when current run segment started
+  let banked = 0;       // total ms from previous run segments (for stop/resume)
+  let lapStartTotal = 0;// total-time value at which current lap began
+  let laps = [];        // lap durations in ms
+
+  const total = () => banked + (running ? Date.now() - startAt : 0);
+  const lapTime = () => total() - lapStartTotal;
+
+  function fmt(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    const mm = String(m % 60).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  }
+
+  function start() {
+    if (running) return;
+    running = true; startAt = Date.now();
+    log('start');
+    syncUI();
+  }
+  function stop() {
+    if (!running) return;
+    banked = total(); running = false;
+    log('stop');
+    syncUI();
+  }
+  function lap() {
+    if (!running) { start(); return; }
+    const now = total();
+    laps.unshift(now - lapStartTotal);
+    lapStartTotal = now;
+    if (navigator.vibrate) navigator.vibrate(30);
+    log(`lap ${laps.length}: ${fmt(laps[0])}`);
+    renderLaps();
+    draw();
+  }
+  function reset() {
+    running = false; banked = 0; lapStartTotal = 0; laps = [];
+    log('reset');
+    renderLaps(); syncUI();
+  }
+
+  function renderLaps() {
+    lapsEl.innerHTML = laps.map((ms, i) =>
+      `<li><span>Lap ${laps.length - i}</span><span>${fmt(ms)}</span></li>`).join('');
+  }
+  function syncUI() {
+    startBtn.textContent = running ? 'Stop' : (total() > 0 ? 'Resume' : 'Start');
+    startBtn.classList.toggle('running', running);
+    lapBtn.disabled = !running;
+    draw();
+  }
+
+  // ---- Drawing (same canvas is the preview AND the PiP video source) ----
+  function lapColor(ms) {
+    if (ms >= 120000) return '#ff453a';
+    if (ms >= 60000) return '#ff9f0a';
+    return '#ffffff';
+  }
+  function draw() {
+    const lt = lapTime(), tt = total();
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+
+    // Ring: fills over 2 minutes of lap time
+    const cx = SIZE / 2, cy = SIZE / 2, r = 170;
+    ctx.lineWidth = 16; ctx.lineCap = 'round';
+    ctx.strokeStyle = '#2c2c2e';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+    const frac = Math.min(lt / 120000, 1);
+    if (frac > 0) {
+      ctx.strokeStyle = lapColor(lt) === '#ffffff' ? '#30d158' : lapColor(lt);
+      ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); ctx.stroke();
+    }
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#8e8e93';
+    ctx.font = '600 30px -apple-system, system-ui, sans-serif';
+    ctx.fillText(running || tt ? `LAP ${laps.length + 1}` : 'READY', cx, cy - 92);
+
+    ctx.fillStyle = lapColor(lt);
+    ctx.font = '700 104px -apple-system, system-ui, sans-serif';
+    ctx.fillText(fmt(lt), cx, cy - 6);
+
+    ctx.fillStyle = '#8e8e93';
+    ctx.font = '500 40px -apple-system, system-ui, sans-serif';
+    ctx.fillText(fmt(tt), cx, cy + 80);
+
+    if (!running && tt > 0) {
+      ctx.fillStyle = '#ff9f0a';
+      ctx.font = '600 24px -apple-system, system-ui, sans-serif';
+      ctx.fillText('STOPPED', cx, cy + 126);
+    }
+  }
+
+  // Redraw loop. rAF stops when the page is hidden, so also use setInterval,
+  // which iOS may still run (throttled) while PiP is active. That's what we're testing.
+  let lastSecond = -1;
+  function tick() {
+    const sec = Math.floor(total() / 1000);
+    // Keep pushing frames even when the number doesn't change so the stream stays alive.
+    draw();
+    if (sec !== lastSecond) lastSecond = sec;
+  }
+  setInterval(tick, 250);
+  (function raf() { tick(); requestAnimationFrame(raf); })();
+
+  // ---- PiP ----
+  let stream = null;
+  let inPiP = false;
+  let lastVisibilityChange = 0;
+
+  function ensureStream() {
+    if (stream) return;
+    stream = canvas.captureStream(10);
+    video.srcObject = stream;
+    log('canvas stream attached');
+  }
+
+  async function enterPiP() {
+    try {
+      ensureStream();
+      await video.play();
+      if (document.pictureInPictureEnabled && video.requestPictureInPicture) {
+        await video.requestPictureInPicture();
+      } else if (typeof video.webkitSetPresentationMode === 'function') {
+        video.webkitSetPresentationMode('picture-in-picture');
+      } else {
+        log('PiP not supported in this browser');
+        return;
+      }
+    } catch (e) {
+      log(`PiP error: ${e.name}: ${e.message}`);
+    }
+  }
+  async function exitPiP() {
+    try {
+      if (document.pictureInPictureElement) await document.exitPictureInPicture();
+      else if (video.webkitPresentationMode === 'picture-in-picture') video.webkitSetPresentationMode('inline');
+    } catch (e) { log(`exit PiP error: ${e.message}`); }
+  }
+
+  video.addEventListener('enterpictureinpicture', () => { inPiP = true; log('PiP entered'); floatBtn.textContent = 'Unfloat'; });
+  video.addEventListener('leavepictureinpicture', () => { inPiP = false; log('PiP left'); floatBtn.textContent = 'Float ⧉'; });
+  video.addEventListener('webkitpresentationmodechanged', () => {
+    inPiP = video.webkitPresentationMode === 'picture-in-picture';
+    log(`presentation mode: ${video.webkitPresentationMode}`);
+    floatBtn.textContent = inPiP ? 'Unfloat' : 'Float ⧉';
+  });
+
+  // The ⏸ button in the PiP window pauses the video. We treat that as "Lap"
+  // and immediately resume playback so the window keeps updating.
+  video.addEventListener('pause', () => {
+    const sinceVis = Date.now() - lastVisibilityChange;
+    log(`video pause (hidden=${document.hidden}, inPiP=${inPiP}, ${sinceVis}ms since visibility change)`);
+    if (!inPiP) return;
+    // Safari may auto-pause when the page is backgrounded; ignore pauses right after that.
+    if (sinceVis < 600) { video.play().catch(() => {}); return; }
+    lap();
+    video.play().catch(e => log(`resume failed: ${e.message}`));
+  });
+  video.addEventListener('play', () => log('video play'));
+
+  // Media Session: some iOS versions route PiP buttons here instead.
+  if ('mediaSession' in navigator) {
+    const ms = navigator.mediaSession;
+    const handlers = {
+      pause: () => { log('mediaSession pause'); if (inPiP) { lap(); video.play().catch(() => {}); } },
+      play: () => { log('mediaSession play'); video.play().catch(() => {}); },
+      nexttrack: () => { log('mediaSession nexttrack'); lap(); },
+      seekforward: () => { log('mediaSession seekforward'); lap(); },
+      seekbackward: () => { log('mediaSession seekbackward'); },
+    };
+    for (const [action, fn] of Object.entries(handlers)) {
+      try { ms.setActionHandler(action, fn); } catch (e) { log(`no mediaSession ${action}`); }
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    lastVisibilityChange = Date.now();
+    log(`visibility: ${document.visibilityState}`);
+  });
+
+  // ---- Buttons ----
+  startBtn.onclick = () => running ? stop() : start();
+  lapBtn.onclick = lap;
+  resetBtn.onclick = reset;
+  floatBtn.onclick = () => inPiP ? exitPiP() : enterPiP();
+
+  // Prime the stream so Float works on the first tap.
+  ensureStream();
+  video.play().catch(() => {});
+  syncUI();
+})();
+</script>
+</body>
+</html>
