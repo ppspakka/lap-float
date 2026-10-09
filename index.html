@@ -80,6 +80,7 @@
 
   <details>
     <summary>Debug log (send me this if something breaks)</summary>
+    <button id="copyLog" style="margin-top:8px;padding:8px 0;font-size:14px;width:100%">Copy log</button>
     <div id="log"></div>
   </details>
 
@@ -233,17 +234,21 @@
     log('canvas stream attached');
   }
 
-  async function enterPiP() {
+  // Must stay synchronous: iOS only allows PiP inside the tap's user activation,
+  // and any `await` before the request loses it.
+  function enterPiP() {
+    ensureStream();
+    if (video.paused) video.play().catch(e => log(`play error: ${e.message}`));
+    log(`Float tapped (paused=${video.paused}, readyState=${video.readyState})`);
     try {
-      ensureStream();
-      await video.play();
-      if (document.pictureInPictureEnabled && video.requestPictureInPicture) {
-        await video.requestPictureInPicture();
-      } else if (typeof video.webkitSetPresentationMode === 'function') {
+      if (typeof video.webkitSetPresentationMode === 'function') {
+        log('using webkitSetPresentationMode');
         video.webkitSetPresentationMode('picture-in-picture');
+      } else if (document.pictureInPictureEnabled && video.requestPictureInPicture) {
+        log('using requestPictureInPicture');
+        video.requestPictureInPicture().catch(e => log(`PiP error: ${e.name}: ${e.message}`));
       } else {
         log('PiP not supported in this browser');
-        return;
       }
     } catch (e) {
       log(`PiP error: ${e.name}: ${e.message}`);
@@ -302,6 +307,8 @@
   lapBtn.onclick = lap;
   resetBtn.onclick = reset;
   floatBtn.onclick = () => inPiP ? exitPiP() : enterPiP();
+  document.getElementById('copyLog').onclick = () =>
+    navigator.clipboard.writeText(logEl.textContent).then(() => log('log copied'), e => log(`copy failed: ${e.message}`));
 
   // Prime the stream so Float works on the first tap.
   ensureStream();
